@@ -250,7 +250,7 @@ void addGraphRecord(float tI, float tE, float lL, float wS);
 uint16_t readBlindPosition(int i);
 void updateBlindPositions(); 
 void flushRelays();
-void saveAllConfigurationToNVS();
+bool saveAllConfigurationToNVS();
 void loadNTCParams();
 void loadConfiguration();
 float safeVal(float val, float fallback = 0.0); 
@@ -994,6 +994,7 @@ uint16_t readBlindPosition(int i) {
   bus.beginTransmission(pca_addr);
   bus.write(0x00);
   bus.endTransmission();
+  delayMicroseconds(50);
   
   return finalPos;
 }
@@ -1066,6 +1067,20 @@ void recoverI2CBus(int busNum) {
   }
 }
 
+bool writePcfState(TwoWire &bus, uint8_t addr, uint8_t state, uint8_t &lastState, int busNum) {
+  bus.beginTransmission(addr);
+  bus.write(state);
+  uint8_t errCode = bus.endTransmission();
+  if (errCode == 0) {
+    lastState = state;
+    return true;
+  }
+
+  Serial.printf("[I2C] Chyba zapisu na vetve %d pre adresu 0x%02X, kod=%u\n", busNum, addr, errCode);
+  recoverI2CBus(busNum);
+  return false;
+}
+
 void flushRelays() {
   static uint8_t last_pcf1 = 0xFF;
   static uint8_t last_pcf2 = 0xFF;
@@ -1093,8 +1108,9 @@ void flushRelays() {
   bool slowSpeedActive = false;
   for (int i = 0; i < 6; i++) {
     if (lastDirection[i] != 0) {
-      if (isMicroAdjusting[i] || seqLightState[i] == 2 || seqTempState[i] == 2 || timeTiltState[i] == 3) { 
+      if (isMicroAdjusting[i] || seqLightState[i] == 2 || seqTempState[i] == 2 || timeTiltState[i] == 1 || timeTiltState[i] == 3) {
         slowSpeedActive = true;
+        break;
       }
     }
   }
@@ -1110,122 +1126,133 @@ void flushRelays() {
     lastForceWrite = now;
   }
 
-  // FIX: PRIDANY ROBUSTNY 3-NASOBNY RETRY MECHANIZMUS S MIKRO PAUZOU (STOP CVAKANIU A REBOOTOM ZBERNICE PRI TRANZIENTOCH)
-  if (pcf1 != last_pcf1 || forceWrite) {
-    uint8_t errCode = 1;
-    for (int r = 0; r < 3; r++) {
-      Wire.beginTransmission(PCF_ADDR_1); 
-      Wire.write(pcf1);
-      errCode = Wire.endTransmission();
-      if (errCode == 0) { 
-        last_pcf1 = pcf1; 
-        break; 
-      }
-      delayMicroseconds(100);
-    }
-    if (errCode != 0) { recoverI2CBus(1); }
+  bool writePcf1 = (pcf1 != last_pcf1 || forceWrite);
+  bool writePcf2 = (pcf2 != last_pcf2 || forceWrite);
+  if (!writePcf1 && !writePcf2) return;
+
+  delayMicroseconds(50);
+  if (writePcf1) {
+    writePcfState(Wire, PCF_ADDR_1, pcf1, last_pcf1, 1);
+    if (writePcf2) delayMicroseconds(50);
   }
 
-  if (pcf2 != last_pcf2 || forceWrite) {
-    uint8_t errCode = 1;
-    for (int r = 0; r < 3; r++) {
-      Wire1.beginTransmission(PCF_ADDR_2); 
-      Wire1.write(pcf2);
-      errCode = Wire1.endTransmission();
-      if (errCode == 0) { 
-        last_pcf2 = pcf2; 
-        break; 
-      }
-      delayMicroseconds(100);
-    }
-    if (errCode != 0) { recoverI2CBus(2); }
+  if (writePcf2) {
+    writePcfState(Wire1, PCF_ADDR_2, pcf2, last_pcf2, 2);
   }
+
+  delayMicroseconds(50);
 }
 
 // FIX: KOREKTNE ROZDELENE PARAMETROV DO INDIVIDUALNYCH SUB-NAMESPACES PRE OCHRANU LIMITOV PAMATE NVS CO DO POCET KLUCOV
-void saveAllConfigurationToNVS() {
-  preferences.begin("terasa_g", false);
-  preferences.putBool("gaute", globalAutoEnable);
-  preferences.putInt("hstart", autoHourStart);
-  preferences.putInt("hend", autoHourEnd);
-  preferences.putInt("atu", allTimeUp);
-  preferences.putInt("atd", allTimeDown);
-  preferences.putInt("etu1", extTimeUpCH1);
-  preferences.putInt("etd1", extTimeDownCH1);
-  preferences.putFloat("wlim", windLimit);
-  preferences.putFloat("wp25", windPulsesFor25kmh);
-  preferences.putInt("ppturn", pulsesPerTurn);
-  preferences.putULong("wsafedur", windSafetyDuration);
-  preferences.putInt("wruntime", windRunTime);
-  preferences.putInt("wmaxhits", windMaxHits);
-  preferences.putInt("mcth", microAdjustThreshold);
-  preferences.putInt("ldrs", ldrSamples);
-  preferences.putFloat("ldrf", ldrFilter);
-  preferences.putInt("nir0", ntcIntR0);
-  preferences.putInt("nib", ntcIntBeta);
-  preferences.putFloat("nisr", ntcIntSeriesR);
-  preferences.putInt("nismp", ntcIntSamples);
-  preferences.putFloat("niflt", ntcIntFilter);
-  preferences.putFloat("nioff", ntcIntOffset);
-  preferences.putInt("ner0", ntcExtR0);
-  preferences.putInt("neb", ntcExtBeta);
-  preferences.putFloat("nesr", ntcExtSeriesR);
-  preferences.putInt("nesmp", ntcExtSamples);
-  preferences.putFloat("neflt", ntcExtFilter);
-  preferences.putFloat("neoff", ntcExtOffset);
+bool saveAllConfigurationToNVS() {
+  Serial.println("[NVS] ZACINAM ULOZENIE VSETKYCH PARAMETROV...");
+  bool writeOk = true;
+
+  preferences.end();
+  if (!preferences.begin("terasa_g", false)) {
+    Serial.println("[NVS] CHYBA: Nepodarilo sa otvorit namespace terasa_g pre zapis.");
+    return false;
+  }
+
+  Serial.println("[NVS] Ukladam globalne nastavenia...");
+  writeOk &= preferences.putBool("gaute", globalAutoEnable) > 0;
+  writeOk &= preferences.putInt("hstart", autoHourStart) > 0;
+  writeOk &= preferences.putInt("hend", autoHourEnd) > 0;
+  writeOk &= preferences.putInt("atu", allTimeUp) > 0;
+  writeOk &= preferences.putInt("atd", allTimeDown) > 0;
+  writeOk &= preferences.putInt("etu1", extTimeUpCH1) > 0;
+  writeOk &= preferences.putInt("etd1", extTimeDownCH1) > 0;
+  writeOk &= preferences.putFloat("wlim", windLimit) > 0;
+  writeOk &= preferences.putFloat("wp25", windPulsesFor25kmh) > 0;
+  writeOk &= preferences.putInt("ppturn", pulsesPerTurn) > 0;
+  writeOk &= preferences.putULong("wsafedur", windSafetyDuration) > 0;
+  writeOk &= preferences.putInt("wruntime", windRunTime) > 0;
+  writeOk &= preferences.putInt("wmaxhits", windMaxHits) > 0;
+  writeOk &= preferences.putInt("mcth", microAdjustThreshold) > 0;
+  writeOk &= preferences.putInt("ldrs", ldrSamples) > 0;
+  writeOk &= preferences.putFloat("ldrf", ldrFilter) > 0;
+  writeOk &= preferences.putInt("nir0", ntcIntR0) > 0;
+  writeOk &= preferences.putInt("nib", ntcIntBeta) > 0;
+  writeOk &= preferences.putFloat("nisr", ntcIntSeriesR) > 0;
+  writeOk &= preferences.putInt("nismp", ntcIntSamples) > 0;
+  writeOk &= preferences.putFloat("niflt", ntcIntFilter) > 0;
+  writeOk &= preferences.putFloat("nioff", ntcIntOffset) > 0;
+  writeOk &= preferences.putInt("ner0", ntcExtR0) > 0;
+  writeOk &= preferences.putInt("neb", ntcExtBeta) > 0;
+  writeOk &= preferences.putFloat("nesr", ntcExtSeriesR) > 0;
+  writeOk &= preferences.putInt("nesmp", ntcExtSamples) > 0;
+  writeOk &= preferences.putFloat("neflt", ntcExtFilter) > 0;
+  writeOk &= preferences.putFloat("neoff", ntcExtOffset) > 0;
   preferences.end();
 
   for (int i = 0; i < 6; i++) {
     char ns[16];
     sprintf(ns, "terasa_b%d", i);
-    preferences.begin(ns, false);
-    
-    preferences.putInt("tu", tUp[i]);
-    preferences.putInt("td", tDown[i]);
-    preferences.putInt("zOff", zeroOffset[i]); 
-    preferences.putBool("ate", autoTempEnable[i]);
-    preferences.putInt("tmd", tempMode[i]);
-    preferences.putFloat("tlu", tempLimitUp[i]);
-    preferences.putFloat("tld", tempLimitDown[i]);
-    preferences.putFloat("thyst", tempHysteresis[i]);
-    preferences.putInt("tta", tTempUp[i]);
-    preferences.putInt("ttd", tTempDown[i]);
+    preferences.end();
+    if (!preferences.begin(ns, false)) {
+      Serial.printf("[NVS] CHYBA: Nepodarilo sa otvorit namespace %s pre zapis.\n", ns);
+      return false;
+    }
 
-    preferences.putBool("ale", autoLightEnable[i]);
-    preferences.putInt("lmd", lightMode[i]);
-    preferences.putInt("llu", lightLimitUp[i]);
-    preferences.putInt("lld", lightLimitDown[i]);
-    preferences.putInt("lhyst", lightHysteresis[i]);
-    preferences.putInt("lta", tLightUp[i]);
-    preferences.putInt("ltd", tLightDown[i]);
-    
-    preferences.putBool("sqle", seqLightEnable[i]);
-    preferences.putFloat("sqlp", seqLightPauseTime[i]);
-    preferences.putInt("sqld", seqLightSecondActionDir[i]);
-    preferences.putFloat("sqlt", seqLightSecondActionTime[i]);
-    
-    preferences.putBool("sqte", seqTempEnable[i]);
-    preferences.putFloat("sqtp", seqTempPauseTime[i]);
-    preferences.putInt("sqtd", seqTempSecondActionDir[i]);
-    preferences.putFloat("sqtt", seqTempSecondActionTime[i]);
-    
-    preferences.putBool("utt", useTimeTilt[i]);
+    Serial.printf("[NVS] Ukladam nastavenia pre zaluziu %d...\n", i + 1);
+    writeOk &= preferences.putInt("tu", tUp[i]) > 0;
+    writeOk &= preferences.putInt("td", tDown[i]) > 0;
+    writeOk &= preferences.putInt("zOff", zeroOffset[i]) > 0;
+    writeOk &= preferences.putBool("ate", autoTempEnable[i]) > 0;
+    writeOk &= preferences.putInt("tmd", tempMode[i]) > 0;
+    writeOk &= preferences.putFloat("tlu", tempLimitUp[i]) > 0;
+    writeOk &= preferences.putFloat("tld", tempLimitDown[i]) > 0;
+    writeOk &= preferences.putFloat("thyst", tempHysteresis[i]) > 0;
+    writeOk &= preferences.putInt("tta", tTempUp[i]) > 0;
+    writeOk &= preferences.putInt("ttd", tTempDown[i]) > 0;
+
+    writeOk &= preferences.putBool("ale", autoLightEnable[i]) > 0;
+    writeOk &= preferences.putInt("lmd", lightMode[i]) > 0;
+    writeOk &= preferences.putInt("llu", lightLimitUp[i]) > 0;
+    writeOk &= preferences.putInt("lld", lightLimitDown[i]) > 0;
+    writeOk &= preferences.putInt("lhyst", lightHysteresis[i]) > 0;
+    writeOk &= preferences.putInt("lta", tLightUp[i]) > 0;
+    writeOk &= preferences.putInt("ltd", tLightDown[i]) > 0;
+
+    writeOk &= preferences.putBool("sqle", seqLightEnable[i]) > 0;
+    writeOk &= preferences.putFloat("sqlp", seqLightPauseTime[i]) > 0;
+    writeOk &= preferences.putInt("sqld", seqLightSecondActionDir[i]) > 0;
+    writeOk &= preferences.putFloat("sqlt", seqLightSecondActionTime[i]) > 0;
+
+    writeOk &= preferences.putBool("sqte", seqTempEnable[i]) > 0;
+    writeOk &= preferences.putFloat("sqtp", seqTempPauseTime[i]) > 0;
+    writeOk &= preferences.putInt("sqtd", seqTempSecondActionDir[i]) > 0;
+    writeOk &= preferences.putFloat("sqtt", seqTempSecondActionTime[i]) > 0;
+
+    writeOk &= preferences.putBool("utt", useTimeTilt[i]) > 0;
     for (int p = 0; p < 8; p++) {
       char key[16];
-      sprintf(key, "d1_%d", p);  preferences.putInt(key, timeTiltDir1[i][p]);
-      sprintf(key, "t1_%d", p);  preferences.putFloat(key, timeTiltDur1[i][p]);
-      sprintf(key, "tp_%d", p);  preferences.putFloat(key, timeTiltPause[i][p]);
-      sprintf(key, "d2_%d", p);  preferences.putInt(key, timeTiltDir2[i][p]);
-      sprintf(key, "t2_%d", p);  preferences.putFloat(key, timeTiltDur2[i][p]);
-      sprintf(key, "p_%d", p);   preferences.putInt(key, (int32_t)tiltPresets[i][p]);
+      sprintf(key, "d1_%d", p);  writeOk &= preferences.putInt(key, timeTiltDir1[i][p]) > 0;
+      sprintf(key, "t1_%d", p);  writeOk &= preferences.putFloat(key, timeTiltDur1[i][p]) > 0;
+      sprintf(key, "tp_%d", p);  writeOk &= preferences.putFloat(key, timeTiltPause[i][p]) > 0;
+      sprintf(key, "d2_%d", p);  writeOk &= preferences.putInt(key, timeTiltDir2[i][p]) > 0;
+      sprintf(key, "t2_%d", p);  writeOk &= preferences.putFloat(key, timeTiltDur2[i][p]) > 0;
+      sprintf(key, "p_%d", p);   writeOk &= preferences.putInt(key, (int32_t)tiltPresets[i][p]) > 0;
     }
     preferences.end();
   }
-  Serial.println("[NVS] Vsetky parametre uspesne ulozene do Preferences.");
+
+  if (!writeOk) {
+    Serial.println("[NVS] CHYBA: Aspom jeden zapis do Preferences zlyhal.");
+    return false;
+  }
+
+  Serial.println("[NVS] ULOZENIE USPESNE DOKONCENE!");
+  return true;
 }
 
 void loadNTCParams() {
-  preferences.begin("terasa_g", true);
+  Serial.println("[NVS] Nacitavam NTC a LDR parametre...");
+  preferences.end();
+  if (!preferences.begin("terasa_g", true)) {
+    Serial.println("[NVS] CHYBA: Nepodarilo sa otvorit namespace terasa_g pre citanie NTC.");
+    return;
+  }
   ntcIntR0 = preferences.getInt("nir0", 10000);
   ntcIntBeta = preferences.getInt("nib", 3977);
   ntcIntSeriesR = preferences.getFloat("nisr", 10000.0);
@@ -1241,10 +1268,16 @@ void loadNTCParams() {
   ldrSamples = preferences.getInt("ldrs", 20);
   ldrFilter = preferences.getFloat("ldrf", 0.10);
   preferences.end();
+  Serial.println("[NVS] NTC a LDR parametre nacitane.");
 }
 
 void loadConfiguration() {
-  preferences.begin("terasa_g", true);
+  Serial.println("[NVS] ZACINAM NACITAVANIE KONFIGURACIE...");
+  preferences.end();
+  if (!preferences.begin("terasa_g", true)) {
+    Serial.println("[NVS] CHYBA: Nepodarilo sa otvorit namespace terasa_g pre citanie.");
+    return;
+  }
   globalAutoEnable = preferences.getBool("gaute", true);
   autoHourStart = preferences.getInt("hstart", 7);
   autoHourEnd = preferences.getInt("hend", 21);
@@ -1264,7 +1297,11 @@ void loadConfiguration() {
   for (int i = 0; i < 6; i++) {
     char ns[16];
     sprintf(ns, "terasa_b%d", i);
-    preferences.begin(ns, true);
+    preferences.end();
+    if (!preferences.begin(ns, true)) {
+      Serial.printf("[NVS] CHYBA: Nepodarilo sa otvorit namespace %s pre citanie.\n", ns);
+      continue;
+    }
     
     tUp[i] = preferences.getInt("tu", 60);
     tDown[i] = preferences.getInt("td", 60);
@@ -1307,6 +1344,7 @@ void loadConfiguration() {
     }
     preferences.end();
   }
+  Serial.println("[NVS] NACITAVANIE USPESNE DOKONCENE!");
 }
 
 float safeVal(float val, float fallback) {
@@ -1808,8 +1846,8 @@ void setup() {
 }
 
 void loop() {
+  if (saveSettingsFlag && saveAllConfigurationToNVS()) saveSettingsFlag = false;
   unsigned long now = millis();
-  if (saveSettingsFlag) { saveAllConfigurationToNVS(); saveSettingsFlag = false; }
   if (resetWindMaxFlag) { windSpeedMax = 0.0; resetWindMaxFlag = false; }
   if (resetIntMinMaxFlag) { tempIntMin = tempInt; tempIntMax = tempInt; resetIntMinMaxFlag = false; }
   if (resetExtMinMaxFlag) { tempExtMin = tempExt; tempExtMax = tempExt; resetExtMinMaxFlag = false; }
