@@ -1641,7 +1641,7 @@ void setup() {
   server.on("/zero", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("i")) {
       int i = request->getParam("i")->value().toInt();
-      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; saveAllConfigurationToNVS(); }
+      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; saveSettingsFlag = true; }
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1732,7 +1732,7 @@ void setup() {
     if (request->hasParam("val")) globalAutoEnable = request->getParam("val")->value().toInt() == 1;
     if (request->hasParam("hstart")) autoHourStart = request->getParam("hstart")->value().toInt();
     if (request->hasParam("hend")) autoHourEnd = request->getParam("hend")->value().toInt();
-    saveAllConfigurationToNVS(); request->send(200, "text/plain", "OK");
+    saveSettingsFlag = true; request->send(200, "text/plain", "OK");
   });
 
   server.on("/saverow", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1768,7 +1768,7 @@ void setup() {
         sprintf(pParam, "p%d", p); 
         if (request->hasParam(pParam)) tiltPresets[i][p] = request->getParam(pParam)->value().toInt(); 
       }
-      saveAllConfigurationToNVS();
+      saveSettingsFlag = true;
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1784,7 +1784,7 @@ void setup() {
         if (request->hasParam("pz")) timeTiltPause[i][p] = request->getParam("pz")->value().toFloat();
         if (request->hasParam("d2")) timeTiltDir2[i][p] = request->getParam("d2")->value().toInt();
         if (request->hasParam("t2")) timeTiltDur2[i][p] = request->getParam("t2")->value().toFloat();
-        saveAllConfigurationToNVS();
+        saveSettingsFlag = true;
       }
     }
     request->send(200, "text/plain", "OK");
@@ -1814,7 +1814,7 @@ void setup() {
     if (request->hasParam("ntceSmp")) ntcExtSamples = request->getParam("ntceSmp")->value().toInt();
     if (request->hasParam("ntceFlt")) ntcExtFilter = request->getParam("ntceFlt")->value().toFloat();
     if (request->hasParam("ntceOff")) ntcExtOffset = request->getParam("ntceOff")->value().toFloat();
-    saveAllConfigurationToNVS(); 
+    saveSettingsFlag = true; 
     request->send(200, "text/plain", "OK");
   });
   server.begin();
@@ -1893,8 +1893,16 @@ void loop() {
   }
 
 
-  // --- V84 FIX: AUTOMATICKE UKLADANIE DO NVS KAZDU MINUTU ---
-  if (now - lastNVSSaveMillis >= NVS_AUTO_SAVE_INTERVAL) {
+  // --- UKLADANIE DO NVS: Flag z web handlerov + automaticky auto-save kazdu minutu ---
+  // DOLEZITE: saveAllConfigurationToNVS() sa vola VYHRADNE z loop() tasku!
+  // Web handlere len nastavia saveSettingsFlag = true (thread-safe volatile bool).
+  // Tak sa vyresia vsetky race conditions s Preferences kniznicu.
+  if (saveSettingsFlag) {
+    saveSettingsFlag = false;
+    lastNVSSaveMillis = now; // Reset auto-save timer po manualnom save
+    saveAllConfigurationToNVS();
+    Serial.println("[NVS] Flag-save: parametre uspesne ulozene do Preferences.");
+  } else if (now - lastNVSSaveMillis >= NVS_AUTO_SAVE_INTERVAL) {
     lastNVSSaveMillis = now;
     saveAllConfigurationToNVS();
     Serial.println("[NVS] Auto-save: parametre uspesne ulozene do Preferences.");
