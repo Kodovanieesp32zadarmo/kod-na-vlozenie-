@@ -102,6 +102,9 @@ volatile bool resetIntMinMaxFlag = false;
 volatile bool resetExtMinMaxFlag = false;
 volatile bool resetWindMaxFlag = false;
 volatile bool saveSettingsFlag = false;
+volatile bool saveSettingsImmediate = false;
+unsigned long settingsDirtySince = 0;
+const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 500;
 
 // --- KALIBRACIA A PARAMETRE FILTROVANIA ---
 int ldrSamples = 20;
@@ -258,6 +261,8 @@ String makeStatusJSON();
 int32_t getEffectivePosition(int i);
 void processButtonStateMachine(int rawState, ButtonStateMachine &sm, int &extMoveUp, int &extMoveDown);
 void recoverI2CBus(int busNum);
+void markSettingsDirty(bool immediate = false);
+bool writeExpanderWithRetry(TwoWire &bus, uint8_t address, uint8_t value);
 
 // --- ASYNCHRONNE WEBOVE ROZHRANIE V PROGMEM ---
 const char index_html[] PROGMEM = R"rawliteral(
@@ -1066,6 +1071,28 @@ void recoverI2CBus(int busNum) {
   }
 }
 
+void markSettingsDirty(bool immediate) {
+  if (!saveSettingsFlag) {
+    settingsDirtySince = millis();
+  }
+  saveSettingsFlag = true;
+  if (immediate) {
+    saveSettingsImmediate = true;
+  }
+}
+
+bool writeExpanderWithRetry(TwoWire &bus, uint8_t address, uint8_t value) {
+  for (int r = 0; r < 3; r++) {
+    bus.beginTransmission(address);
+    bus.write(value);
+    if (bus.endTransmission() == 0) {
+      return true;
+    }
+    delayMicroseconds(120);
+  }
+  return false;
+}
+
 void flushRelays() {
   static uint8_t last_pcf1 = 0xFF;
   static uint8_t last_pcf2 = 0xFF;
@@ -1093,7 +1120,8 @@ void flushRelays() {
   bool slowSpeedActive = false;
   for (int i = 0; i < 6; i++) {
     if (lastDirection[i] != 0) {
-      if (isMicroAdjusting[i] || seqLightState[i] == 2 || seqTempState[i] == 2 || timeTiltState[i] == 3) { 
+      bool timeTiltSlowStep = (timeTiltState[i] == 3 && runDirection[i] != 0);
+      if (isMicroAdjusting[i] || seqLightState[i] == 2 || seqTempState[i] == 2 || timeTiltSlowStep) {
         slowSpeedActive = true;
       }
     }
@@ -1110,35 +1138,37 @@ void flushRelays() {
     lastForceWrite = now;
   }
 
-  // FIX: PRIDANY ROBUSTNY 3-NASOBNY RETRY MECHANIZMUS S MIKRO PAUZOU (STOP CVAKANIU A REBOOTOM ZBERNICE PRI TRANZIENTOCH)
+  bool wrotePcf1 = false;
   if (pcf1 != last_pcf1 || forceWrite) {
-    uint8_t errCode = 1;
-    for (int r = 0; r < 3; r++) {
-      Wire.beginTransmission(PCF_ADDR_1); 
-      Wire.write(pcf1);
-      errCode = Wire.endTransmission();
-      if (errCode == 0) { 
-        last_pcf1 = pcf1; 
-        break; 
-      }
-      delayMicroseconds(100);
+    bool motorBitsChanged = (((pcf1 ^ last_pcf1) & 0x3F) != 0);
+    if (motorBitsChanged) {
+      uint8_t isolatedState = (pcf1 & ~0x3F);
+      writeExpanderWithRetry(Wire, PCF_ADDR_1, isolatedState);
+      delayMicroseconds(220);
     }
-    if (errCode != 0) { recoverI2CBus(1); }
+    if (writeExpanderWithRetry(Wire, PCF_ADDR_1, pcf1)) {
+      last_pcf1 = pcf1;
+      wrotePcf1 = true;
+    } else {
+      recoverI2CBus(1);
+    }
   }
 
   if (pcf2 != last_pcf2 || forceWrite) {
-    uint8_t errCode = 1;
-    for (int r = 0; r < 3; r++) {
-      Wire1.beginTransmission(PCF_ADDR_2); 
-      Wire1.write(pcf2);
-      errCode = Wire1.endTransmission();
-      if (errCode == 0) { 
-        last_pcf2 = pcf2; 
-        break; 
-      }
-      delayMicroseconds(100);
+    bool motorBitsChanged = (((pcf2 ^ last_pcf2) & 0x3F) != 0);
+    if (wrotePcf1) {
+      delayMicroseconds(220);
     }
-    if (errCode != 0) { recoverI2CBus(2); }
+    if (motorBitsChanged) {
+      uint8_t isolatedState = (pcf2 & ~0x3F);
+      writeExpanderWithRetry(Wire1, PCF_ADDR_2, isolatedState);
+      delayMicroseconds(220);
+    }
+    if (writeExpanderWithRetry(Wire1, PCF_ADDR_2, pcf2)) {
+      last_pcf2 = pcf2;
+    } else {
+      recoverI2CBus(2);
+    }
   }
 }
 
@@ -1628,7 +1658,7 @@ void setup() {
   server.on("/zero", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("i")) {
       int i = request->getParam("i")->value().toInt();
-      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; saveSettingsFlag = true; }
+      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; markSettingsDirty(true); }
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1719,7 +1749,7 @@ void setup() {
     if (request->hasParam("val")) globalAutoEnable = request->getParam("val")->value().toInt() == 1;
     if (request->hasParam("hstart")) autoHourStart = request->getParam("hstart")->value().toInt();
     if (request->hasParam("hend")) autoHourEnd = request->getParam("hend")->value().toInt();
-    saveSettingsFlag = true; request->send(200, "text/plain", "OK");
+    markSettingsDirty(true); request->send(200, "text/plain", "OK");
   });
 
   server.on("/saverow", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1755,7 +1785,7 @@ void setup() {
         sprintf(pParam, "p%d", p); 
         if (request->hasParam(pParam)) tiltPresets[i][p] = request->getParam(pParam)->value().toInt(); 
       }
-      saveSettingsFlag = true;
+      markSettingsDirty(true);
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1771,7 +1801,7 @@ void setup() {
         if (request->hasParam("pz")) timeTiltPause[i][p] = request->getParam("pz")->value().toFloat();
         if (request->hasParam("d2")) timeTiltDir2[i][p] = request->getParam("d2")->value().toInt();
         if (request->hasParam("t2")) timeTiltDur2[i][p] = request->getParam("t2")->value().toFloat();
-        saveSettingsFlag = true;
+        markSettingsDirty(true);
       }
     }
     request->send(200, "text/plain", "OK");
@@ -1801,7 +1831,7 @@ void setup() {
     if (request->hasParam("ntceSmp")) ntcExtSamples = request->getParam("ntceSmp")->value().toInt();
     if (request->hasParam("ntceFlt")) ntcExtFilter = request->getParam("ntceFlt")->value().toFloat();
     if (request->hasParam("ntceOff")) ntcExtOffset = request->getParam("ntceOff")->value().toFloat();
-    saveSettingsFlag = true; 
+    markSettingsDirty(true);
     request->send(200, "text/plain", "OK");
   });
   server.begin();
@@ -1809,7 +1839,13 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-  if (saveSettingsFlag) { saveAllConfigurationToNVS(); saveSettingsFlag = false; }
+  if (saveSettingsFlag) {
+    if (saveSettingsImmediate || (now - settingsDirtySince >= SETTINGS_SAVE_DEBOUNCE_MS)) {
+      saveAllConfigurationToNVS();
+      saveSettingsFlag = false;
+      saveSettingsImmediate = false;
+    }
+  }
   if (resetWindMaxFlag) { windSpeedMax = 0.0; resetWindMaxFlag = false; }
   if (resetIntMinMaxFlag) { tempIntMin = tempInt; tempIntMax = tempInt; resetIntMinMaxFlag = false; }
   if (resetExtMinMaxFlag) { tempExtMin = tempExt; tempExtMax = tempExt; resetExtMinMaxFlag = false; }
@@ -1961,9 +1997,11 @@ void loop() {
           timeTiltTimer[i] = millis() + (unsigned long)(timeTiltPause[i][p] * 1000.0);
           runDirection[i] = 0;
           runUntil[i] = 0;
+          isMicroAdjusting[i] = false;
         } else {
           runDirection[i] = timeTiltDir1[i][p];
           runUntil[i] = timeTiltTimer[i];
+          isMicroAdjusting[i] = false;
         }
       } 
       else if (timeTiltState[i] == 2) { 
@@ -1974,14 +2012,17 @@ void loop() {
             timeTiltTimer[i] = millis() + (unsigned long)(dur2 * 1000.0);
             runDirection[i] = timeTiltDir2[i][p];
             runUntil[i] = timeTiltTimer[i];
+            isMicroAdjusting[i] = true;
           } else {
             timeTiltState[i] = 0;
             runDirection[i] = 0;
             runUntil[i] = 0;
+            isMicroAdjusting[i] = false;
           }
         } else {
           runDirection[i] = 0;
           runUntil[i] = 0;
+          isMicroAdjusting[i] = false;
         }
       } 
       else if (timeTiltState[i] == 3) { 
@@ -1989,9 +2030,11 @@ void loop() {
           timeTiltState[i] = 0;
           runDirection[i] = 0;
           runUntil[i] = 0;
+          isMicroAdjusting[i] = false;
         } else {
           runDirection[i] = timeTiltDir2[i][p];
           runUntil[i] = timeTiltTimer[i];
+          isMicroAdjusting[i] = true;
         }
       }
     }
