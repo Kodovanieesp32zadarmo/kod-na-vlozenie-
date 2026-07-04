@@ -102,6 +102,7 @@ volatile bool resetIntMinMaxFlag = false;
 volatile bool resetExtMinMaxFlag = false;
 volatile bool resetWindMaxFlag = false;
 volatile bool saveSettingsFlag = false;
+SemaphoreHandle_t _prefsMutex = NULL;
 
 // --- KALIBRACIA A PARAMETRE FILTROVANIA ---
 int ldrSamples = 20;
@@ -1144,6 +1145,7 @@ void flushRelays() {
 
 // FIX: KOREKTNE ROZDELENE PARAMETROV DO INDIVIDUALNYCH SUB-NAMESPACES PRE OCHRANU LIMITOV PAMATE NVS CO DO POCET KLUCOV
 void saveAllConfigurationToNVS() {
+  if (_prefsMutex) xSemaphoreTake(_prefsMutex, portMAX_DELAY);
   preferences.begin("terasa_g", false);
   preferences.putBool("gaute", globalAutoEnable);
   preferences.putInt("hstart", autoHourStart);
@@ -1222,9 +1224,11 @@ void saveAllConfigurationToNVS() {
     preferences.end();
   }
   Serial.println("[NVS] Vsetky parametre uspesne ulozene do Preferences.");
+  if (_prefsMutex) xSemaphoreGive(_prefsMutex);
 }
 
 void loadNTCParams() {
+  if (_prefsMutex) xSemaphoreTake(_prefsMutex, portMAX_DELAY);
   preferences.begin("terasa_g", true);
   ntcIntR0 = preferences.getInt("nir0", 10000);
   ntcIntBeta = preferences.getInt("nib", 3977);
@@ -1241,9 +1245,11 @@ void loadNTCParams() {
   ldrSamples = preferences.getInt("ldrs", 20);
   ldrFilter = preferences.getFloat("ldrf", 0.10);
   preferences.end();
+  if (_prefsMutex) xSemaphoreGive(_prefsMutex);
 }
 
 void loadConfiguration() {
+  if (_prefsMutex) xSemaphoreTake(_prefsMutex, portMAX_DELAY);
   preferences.begin("terasa_g", true);
   globalAutoEnable = preferences.getBool("gaute", true);
   autoHourStart = preferences.getInt("hstart", 7);
@@ -1307,6 +1313,7 @@ void loadConfiguration() {
     }
     preferences.end();
   }
+  if (_prefsMutex) xSemaphoreGive(_prefsMutex);
 }
 
 float safeVal(float val, float fallback) {
@@ -1559,6 +1566,8 @@ void setup() {
     err = nvs_flash_init();
   }
 
+  _prefsMutex = xSemaphoreCreateMutex();
+
   loadConfiguration(); loadNTCParams();
   WiFi.mode(WIFI_STA);
   WiFi.config(local_IP, gateway, subnet, primaryDNS); WiFi.begin(ssid, password);
@@ -1628,7 +1637,7 @@ void setup() {
   server.on("/zero", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("i")) {
       int i = request->getParam("i")->value().toInt();
-      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; saveSettingsFlag = true; }
+      if (i >= 0 && i < 6) { zeroOffset[i] = blindPosition[i]; saveAllConfigurationToNVS(); }
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1719,7 +1728,7 @@ void setup() {
     if (request->hasParam("val")) globalAutoEnable = request->getParam("val")->value().toInt() == 1;
     if (request->hasParam("hstart")) autoHourStart = request->getParam("hstart")->value().toInt();
     if (request->hasParam("hend")) autoHourEnd = request->getParam("hend")->value().toInt();
-    saveSettingsFlag = true; request->send(200, "text/plain", "OK");
+    saveAllConfigurationToNVS(); request->send(200, "text/plain", "OK");
   });
 
   server.on("/saverow", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1755,7 +1764,7 @@ void setup() {
         sprintf(pParam, "p%d", p); 
         if (request->hasParam(pParam)) tiltPresets[i][p] = request->getParam(pParam)->value().toInt(); 
       }
-      saveSettingsFlag = true;
+      saveAllConfigurationToNVS();
     }
     request->send(200, "text/plain", "OK");
   });
@@ -1771,7 +1780,7 @@ void setup() {
         if (request->hasParam("pz")) timeTiltPause[i][p] = request->getParam("pz")->value().toFloat();
         if (request->hasParam("d2")) timeTiltDir2[i][p] = request->getParam("d2")->value().toInt();
         if (request->hasParam("t2")) timeTiltDur2[i][p] = request->getParam("t2")->value().toFloat();
-        saveSettingsFlag = true;
+        saveAllConfigurationToNVS();
       }
     }
     request->send(200, "text/plain", "OK");
@@ -1801,7 +1810,7 @@ void setup() {
     if (request->hasParam("ntceSmp")) ntcExtSamples = request->getParam("ntceSmp")->value().toInt();
     if (request->hasParam("ntceFlt")) ntcExtFilter = request->getParam("ntceFlt")->value().toFloat();
     if (request->hasParam("ntceOff")) ntcExtOffset = request->getParam("ntceOff")->value().toFloat();
-    saveSettingsFlag = true; 
+    saveAllConfigurationToNVS(); 
     request->send(200, "text/plain", "OK");
   });
   server.begin();
@@ -1809,7 +1818,6 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-  if (saveSettingsFlag) { saveAllConfigurationToNVS(); saveSettingsFlag = false; }
   if (resetWindMaxFlag) { windSpeedMax = 0.0; resetWindMaxFlag = false; }
   if (resetIntMinMaxFlag) { tempIntMin = tempInt; tempIntMax = tempInt; resetIntMinMaxFlag = false; }
   if (resetExtMinMaxFlag) { tempExtMin = tempExt; tempExtMax = tempExt; resetExtMinMaxFlag = false; }
